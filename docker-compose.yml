@@ -1,0 +1,33 @@
+services:
+  neuro_fusion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: neuro_fusion_dev
+    # ── Networking ───────────────────────────────────────────────────────────
+    # Use host networking if Linux, but on macOS/Windows 'host' is distinct.
+    # Bridge mode with port mapping is standard, but simplified here.
+    network_mode: bridge
+    ports:
+      - "14540:14540/udp" # PX4 SITL
+      - "14550:14550/udp" # QGroundControl
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+    # Mount the current project directly into the ROS 2 workspace src folder.
+    # Benefit: Edits on host (VS Code) reflect instantly in container.
+    volumes:
+      - .:/root/ros2_ws/src/neuro_adaptive_fusion
+
+    # ── GUI / X11 ────────────────────────────────────────────────────────────
+    # macOS XQuartz setup:
+    # 1. Install XQuartz (brew install --cask xquartz)
+    # 2. XQuartz Preferences -> Security -> "Allow connections from network clients"
+    # 3. xhost +localhost (on host)
+    environment:
+      - DISPLAY=host.docker.internal:0
+      - QT_X11_NO_MITSHM=1
+
+    # ── Runtime ──────────────────────────────────────────────────────────────
+    stdin_open: true # docker run -i
+    tty: true        # docker run -t
+    command: /bin/bash
