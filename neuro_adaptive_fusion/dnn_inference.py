@@ -16,8 +16,6 @@ Pipeline
 Output: Float32MultiArray of shape (6,) — the full adapted diagonal R_adapt.
 """
 
-"""dnn_inference.py — ROS 2 node: TFLite Supervisor DNN Inference."""
-
 
 import pathlib
 import threading
