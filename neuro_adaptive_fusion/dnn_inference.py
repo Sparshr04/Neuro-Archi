@@ -1,172 +1,101 @@
-from __future__ import annotations
-
-"""dnn_inference.py — ROS 2 node: TFLite Supervisor DNN Inference.
-
-Loads the INT8-quantised ``neuro_adapter.tflite`` model and runs inference
-on each incoming feature vector to produce the adaptive covariance
-correction ΔR.
-
-Equation 30 (Springer chapter):
-    R_adapt = R₀ + α · ΔR_dnn
-
-Pipeline
---------
-  /neuro/features  →  [DNNInference]  →  /neuro/covariance_correction
-
-Output: Float32MultiArray of shape (6,) — the full adapted diagonal R_adapt.
-"""
-
-
-import pathlib
-import threading
-import time
-from typing import Final
-
-import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, MultiArrayDimension
-
-from ament_index_python.packages import get_package_share_directory
+from std_msgs.msg import Float32MultiArray
+import numpy as np
+import os
 from tflite_runtime.interpreter import Interpreter
 
-
-# ── Constants ────────────────────────────────────────────────────────────────
-N_CHANNELS: Final[int] = 6
-N_FEATURES: Final[int] = 24
-DEFAULT_MODEL_PATH: Final[str] = ""  # ← IMPORTANT CHANGE
-DEFAULT_ALPHA: Final[float] = 1.0
-
-R0_VAR: Final[np.ndarray] = np.array(
-    [
-        0.012**2,
-        0.012**2,
-        0.012**2,
-        0.004**2,
-        0.004**2,
-        0.004**2,
-    ],
-    dtype=np.float32,
-)
-
-
 class DNNInference(Node):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__("dnn_inference")
 
-        # ── Parameters ───────────────────────────────────────────────────────
-        self.declare_parameter("model_path", DEFAULT_MODEL_PATH)
-        self.declare_parameter("alpha", DEFAULT_ALPHA)
+        # 1. Load Parameters
+        self.declare_parameter("alpha", 5000.0)
+        self.alpha = self.get_parameter("alpha").get_parameter_value().double_value
 
-        self._alpha: float = (
-            self.get_parameter("alpha").get_parameter_value().double_value
-        )
+        # CRITICAL FIX: Hardcoded Absolute Path to the Installed Model
+        # This bypasses all "smart" logic that was failing to find the file.
+        model_path = "/root/ros2_ws/install/neuro_adaptive_fusion/share/neuro_adaptive_fusion/models/neuro_adapter.tflite"
 
-        model_path_param = (
-            self.get_parameter("model_path").get_parameter_value().string_value
-        )
+        self.get_logger().info(f"Loading TFLite from ABSOLUTE path: {model_path}")
 
-        # ── Resolve model path (ROS-native) ──────────────────────────────────
-        if model_path_param:
-            model_path = pathlib.Path(model_path_param)
-        else:
-            pkg_share = pathlib.Path(
-                get_package_share_directory("neuro_adaptive_fusion")
-            )
-            model_path = pkg_share / "models" / "neuro_adapter.tflite"
-
-        # ── Load TFLite Interpreter ──────────────────────────────────────────
-        if not model_path.exists():
-            self.get_logger().fatal(f"Model not found: {model_path}")
-            raise FileNotFoundError(f"TFLite model not found: {model_path}")
-
-        self._interpreter = Interpreter(model_path=str(model_path))
-        self._interpreter.allocate_tensors()
-
-        self.get_logger().info(f"✅ TFLite model loaded: {model_path}")
-
-        self._input_detail = self._interpreter.get_input_details()[0]
-        self._output_detail = self._interpreter.get_output_details()[0]
-
-        self._input_dtype = self._input_detail["dtype"]
-        qp = self._input_detail.get("quantization_parameters", {})
-        self._input_scale = float(qp.get("scales", [1.0])[0])
-        self._input_zp = int(qp.get("zero_points", [0])[0])
-
-        self._lock = threading.Lock()
-
-        self.get_logger().info(
-            f"DNNInference ready [α={self._alpha}, input_dtype={self._input_dtype}]"
-        )
-
-        # ── Pub / Sub ────────────────────────────────────────────────────────
-        self._sub = self.create_subscription(
-            Float32MultiArray,
-            "/neuro/features",
-            self._feature_cb,
-            10,
-        )
-
-        self._pub = self.create_publisher(
-            Float32MultiArray,
-            "/neuro/covariance_correction",
-            10,
-        )
-
-    # ── Callback ─────────────────────────────────────────────────────────────
-
-    def _feature_cb(self, msg: Float32MultiArray) -> None:
-        features = np.array(msg.data, dtype=np.float32)
-
-        if features.shape[0] != N_FEATURES:
-            self.get_logger().warn(
-                f"Expected {N_FEATURES} features, got {features.shape[0]}",
-                throttle_duration_sec=5.0,
-            )
+        try:
+            self.interpreter = Interpreter(model_path=model_path)
+            self.interpreter.allocate_tensors()
+            self.input_details = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+            
+            # Get Quantization Parameters
+            self.input_scale, self.input_zero = self.input_details[0]['quantization']
+            self.output_scale, self.output_zero = self.output_details[0]['quantization']
+            
+            self.get_logger().info(f"✅ INT8 Model Loaded! Scale: {self.input_scale}")
+        except Exception as e:
+            self.get_logger().error(f"❌ Model Load FATAL: {e}")
+            # If model fails, we MUST kill the node or it will look like it's running but do nothing
+            self.destroy_node()
             return
 
-        input_tensor = features.reshape(1, N_FEATURES)
+        self.sub = self.create_subscription(Float32MultiArray, "/neuro/features", self.callback, 10)
+        self.pub = self.create_publisher(Float32MultiArray, "/neuro/covariance_correction", 10)
 
-        if self._input_dtype == np.int8:
-            input_tensor = np.round(input_tensor / self._input_scale) + self._input_zp
-            input_tensor = np.clip(input_tensor, -128, 127).astype(np.int8)
-        elif self._input_dtype == np.uint8:
-            input_tensor = np.round(input_tensor / self._input_scale) + self._input_zp
-            input_tensor = np.clip(input_tensor, 0, 255).astype(np.uint8)
+    def callback(self, msg):
+        features = np.array(msg.data, dtype=np.float32)
 
-        with self._lock:
-            t0 = time.monotonic_ns()
-            self._interpreter.set_tensor(self._input_detail["index"], input_tensor)
-            self._interpreter.invoke()
-            output = self._interpreter.get_tensor(self._output_detail["index"])
-            delta_r = output.flatten().astype(np.float32)
-            dt_us = (time.monotonic_ns() - t0) / 1e3
+        # --- PATH A: Neural Network (INT8 Quantized) ---
+        # 1. Quantize: Float -> Int8
+        if self.input_scale > 0:
+            input_int8 = (features / self.input_scale) + self.input_zero
+            input_int8 = np.clip(input_int8, -128, 127).astype(np.int8)
+        else:
+            input_int8 = features.astype(np.int8)
 
-        r_adapt = R0_VAR + self._alpha * np.clip(delta_r, 0.0, None)
+        # 2. Run Inference
+        input_tensor = np.expand_dims(input_int8, axis=0)
+        self.interpreter.set_tensor(self.input_details[0]["index"], input_tensor)
+        self.interpreter.invoke()
+        output_int8 = self.interpreter.get_tensor(self.output_details[0]["index"])[0]
 
-        msg_out = Float32MultiArray()
-        msg_out.layout.dim = [
-            MultiArrayDimension(
-                label="r_adapt_diag",
-                size=N_CHANNELS,
-                stride=N_CHANNELS,
+        # 3. Dequantize: Int8 -> Float
+        if self.output_scale > 0:
+            ai_output = (output_int8.astype(np.float32) - self.output_zero) * self.output_scale
+        else:
+            ai_output = output_int8.astype(np.float32)
+
+        # --- PATH B: Safety Logic (Backup) ---
+        # ZCR is feature indices 18-23. High ZCR = Vibration.
+        zcr_avg = np.mean(features[18:24])
+        logic_output = np.zeros_like(ai_output)
+        
+        # Transition Logic: If vibration > threshold, ramp up correction
+        if zcr_avg > 0.05:
+            logic_output[:] = zcr_avg * 2.0 
+
+        # --- FUSION: Safety Gate ---
+        # Use maximum of AI and Logic to ensure safety
+        raw_correction = np.maximum(ai_output, logic_output)
+        
+        # Apply Gain
+        final_correction = raw_correction * self.alpha
+
+        # Logging for verification
+        if np.max(final_correction) > 10.0:
+            self.get_logger().info(
+                f"Active! AI: {np.max(ai_output):.4f} | "
+                f"Logic: {np.max(logic_output):.4f} | "
+                f"Final: {np.max(final_correction):.1f}"
             )
-        ]
-        msg_out.data = r_adapt.tolist()
-        self._pub.publish(msg_out)
 
-        self.get_logger().debug(f"Inference {dt_us:.0f} µs | R={r_adapt}")
+        out_msg = Float32MultiArray()
+        out_msg.data = final_correction.tolist()
+        self.pub.publish(out_msg)
 
-
-def main(args=None) -> None:
+def main(args=None):
     rclpy.init(args=args)
     node = DNNInference()
-    try:
-        rclpy.spin(node)
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
