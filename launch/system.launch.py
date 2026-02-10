@@ -18,7 +18,7 @@ def generate_launch_description() -> LaunchDescription:
     # ── Arguments ────────────────────────────────────────────────────────────
     model_path_arg = DeclareLaunchArgument(
         "model_path",
-        default_value="ml_core/models/neuro_adapter.tflite",
+        default_value="",
         description="Path to the INT8 TFLite model.",
     )
     alpha_arg = DeclareLaunchArgument(
