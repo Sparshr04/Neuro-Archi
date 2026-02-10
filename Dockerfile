@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y \
 # Using --break-system-packages because we are in a container environment.
 RUN pip3 install --upgrade pip setuptools wheel && \
     pip3 install --no-cache-dir \
-    tensorflow \
+    tflite-runtime==2.14.* \
     mavsdk \
     matplotlib \
     scipy 
