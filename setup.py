@@ -1,32 +1,27 @@
 from setuptools import find_packages, setup
-from glob import glob
 import os
+from glob import glob
 
 package_name = "neuro_adaptive_fusion"
 
 setup(
     name=package_name,
     version="0.1.0",
-    # Include both the main ROS package and our ML core library
-    packages=[package_name, "ml_core"],
-    package_dir={
-        package_name: "neuro_adaptive_fusion",
-        "ml_core": "ml_core",
-    },
+    # find_packages() correctly detects both 'neuro_adaptive_fusion' and 'ml_core'
+    packages=find_packages(exclude=["test"]),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        # Include all launch files
-        (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
-        # Include TFLite models for runtime
+        ("share/" + package_name + "/launch", ["launch/system.launch.py"]),
+        # CRITICAL: Re-added this line so the node can find your AI model
         (os.path.join("share", package_name, "models"), glob("ml_core/models/*.tflite")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
-    maintainer="Sparsh",
-    maintainer_email="sparsh@todo.com",
-    description="Neuro-Adaptive Sensor Fusion ROS 2 nodes for Hybrid VTOL UAV.",
-    license="MIT",
+    maintainer="sparsh",
+    maintainer_email="sparsh@dypiu.ac.in",
+    description="Neuro-Adaptive Sensor Fusion Package",
+    license="Proprietary",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
