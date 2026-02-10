@@ -26,11 +26,9 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 
-# ── TFLite runtime import (RPi vs host fallback) ────────────────────────────
-try:
-    from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
-except ImportError:
-    from tensorflow.lite.python.interpreter import Interpreter as TFLiteInterpreter  # type: ignore[no-redef]
+# ── Force TensorFlow Lite Interpreter (avoid tflite_runtime on ARM64 if possible) ──
+import tensorflow as tf
+
 
 # ── Constants ────────────────────────────────────────────────────────────────
 N_CHANNELS: Final[int] = 6
@@ -67,18 +65,26 @@ class DNNInference(Node):
         self.declare_parameter("model_path", DEFAULT_MODEL_PATH)
         self.declare_parameter("alpha", DEFAULT_ALPHA)
 
-        model_path = pathlib.Path(
+        model_path_str = (
             self.get_parameter("model_path").get_parameter_value().string_value
         )
-        self._alpha: float = self.get_parameter("alpha").get_parameter_value().double_value
+        model_path = pathlib.Path(model_path_str)
+        self._alpha: float = (
+            self.get_parameter("alpha").get_parameter_value().double_value
+        )
 
-        # ── Load TFLite interpreter (once) ───────────────────────────────────
+        # ── Load TFLite interpreter (Robust) ─────────────────────────────────
         if not model_path.exists():
             self.get_logger().fatal(f"Model not found: {model_path}")
             raise FileNotFoundError(f"TFLite model not found: {model_path}")
 
-        self._interpreter = TFLiteInterpreter(model_path=str(model_path))
-        self._interpreter.allocate_tensors()
+        try:
+            self._interpreter = tf.lite.Interpreter(model_path=str(model_path))
+            self._interpreter.allocate_tensors()
+            self.get_logger().info("✅ TFLite Interpreter Loaded Successfully")
+        except Exception as e:
+            self.get_logger().fatal(f"Failed to initialize TFLite Interpreter: {e}")
+            raise
 
         self._input_detail = self._interpreter.get_input_details()[0]
         self._output_detail = self._interpreter.get_output_details()[0]
@@ -114,6 +120,7 @@ class DNNInference(Node):
 
     def _feature_cb(self, msg: Float32MultiArray) -> None:
         """Run inference on incoming feature vector and publish R_adapt."""
+        # STRICT TYPE CASTING to float32 to avoid segfaults in some TFLite builds
         features = np.array(msg.data, dtype=np.float32)
 
         if features.shape[0] != N_FEATURES:
@@ -124,31 +131,31 @@ class DNNInference(Node):
             return
 
         # ── Quantise input if model expects INT8 ────────────────────────────
+        # Ensure input tensor matches model input shape (1, 24)
         input_tensor = features.reshape(1, N_FEATURES)
+
         if self._input_dtype == np.int8:
-            input_tensor = np.clip(
-                np.round(input_tensor / self._input_scale) + self._input_zp,
-                -128,
-                127,
-            ).astype(np.int8)
+            # Scale and zero-point arithmetic
+            input_tensor = np.round(input_tensor / self._input_scale) + self._input_zp
+            input_tensor = np.clip(input_tensor, -128, 127).astype(np.int8)
         elif self._input_dtype == np.uint8:
-            input_tensor = np.clip(
-                np.round(input_tensor / self._input_scale) + self._input_zp,
-                0,
-                255,
-            ).astype(np.uint8)
+            input_tensor = np.round(input_tensor / self._input_scale) + self._input_zp
+            input_tensor = np.clip(input_tensor, 0, 255).astype(np.uint8)
 
         # ── Inference (serialised) ──────────────────────────────────────────
         with self._lock:
-            t0: int = time.monotonic_ns()
-            self._interpreter.set_tensor(self._input_detail["index"], input_tensor)
-            self._interpreter.invoke()
-            delta_r = (
-                self._interpreter.get_tensor(self._output_detail["index"])
-                .flatten()
-                .astype(np.float32)
-            )
-            dt_us: float = (time.monotonic_ns() - t0) / 1e3
+            try:
+                t0: int = time.monotonic_ns()
+                self._interpreter.set_tensor(self._input_detail["index"], input_tensor)
+                self._interpreter.invoke()
+                output_data = self._interpreter.get_tensor(self._output_detail["index"])
+                delta_r = output_data.flatten().astype(np.float32)
+                dt_us: float = (time.monotonic_ns() - t0) / 1e3
+            except Exception as e:
+                self.get_logger().error(
+                    f"Inference failed: {e}", throttle_duration_sec=1.0
+                )
+                return
 
         # ── Eq 30:  R_adapt = R₀ + α · ΔR_dnn ──────────────────────────────
         delta_r_clamped: np.ndarray = np.clip(delta_r, 0.0, None)  # ΔR ≥ 0
