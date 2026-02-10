@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+
+# uv
+uv.lock
+
+# ML artefacts
+ml_core/models/*.tflite
+ml_core/models/innov_cov_dnn/
+ml_core/data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ROS 2 build
+install/
+log/
