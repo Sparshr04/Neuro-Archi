@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """dnn_inference.py — ROS 2 node: TFLite Supervisor DNN Inference.
 
 Loads the INT8-quantised ``neuro_adapter.tflite`` model and runs inference
@@ -14,7 +16,8 @@ Pipeline
 Output: Float32MultiArray of shape (6,) — the full adapted diagonal R_adapt.
 """
 
-from __future__ import annotations
+"""dnn_inference.py — ROS 2 node: TFLite Supervisor DNN Inference."""
+
 
 import pathlib
 import threading
@@ -26,38 +29,30 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 
-# ── Force TensorFlow Lite Interpreter (avoid tflite_runtime on ARM64 if possible) ──
-import tensorflow as tf
+from ament_index_python.packages import get_package_share_directory
+from tflite_runtime.interpreter import Interpreter
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 N_CHANNELS: Final[int] = 6
-N_FEATURES: Final[int] = 24  # 4 features × 6 channels
-DEFAULT_MODEL_PATH: Final[str] = "ml_core/models/neuro_adapter.tflite"
-DEFAULT_ALPHA: Final[float] = 1.0  # blending gain α (Eq 30)
+N_FEATURES: Final[int] = 24
+DEFAULT_MODEL_PATH: Final[str] = ""  # ← IMPORTANT CHANGE
+DEFAULT_ALPHA: Final[float] = 1.0
 
-# Baseline measurement-noise variance R₀ (diagonal)
 R0_VAR: Final[np.ndarray] = np.array(
     [
-        0.012**2,  # accel x
-        0.012**2,  # accel y
-        0.012**2,  # accel z
-        0.004**2,  # gyro  x
-        0.004**2,  # gyro  y
-        0.004**2,  # gyro  z
+        0.012**2,
+        0.012**2,
+        0.012**2,
+        0.004**2,
+        0.004**2,
+        0.004**2,
     ],
     dtype=np.float32,
 )
 
 
 class DNNInference(Node):
-    """Run the quantised Supervisor DNN and publish R_adapt.
-
-    Thread-safety: the TFLite interpreter is NOT thread-safe.  All access
-    is serialised by ``_lock``.  Under the default SingleThreadedExecutor
-    this is redundant but guarantees correctness under MultiThreadedExecutor.
-    """
-
     def __init__(self) -> None:
         super().__init__("dnn_inference")
 
@@ -65,42 +60,45 @@ class DNNInference(Node):
         self.declare_parameter("model_path", DEFAULT_MODEL_PATH)
         self.declare_parameter("alpha", DEFAULT_ALPHA)
 
-        model_path_str = (
-            self.get_parameter("model_path").get_parameter_value().string_value
-        )
-        model_path = pathlib.Path(model_path_str)
         self._alpha: float = (
             self.get_parameter("alpha").get_parameter_value().double_value
         )
 
-        # ── Load TFLite interpreter (Robust) ─────────────────────────────────
+        model_path_param = (
+            self.get_parameter("model_path").get_parameter_value().string_value
+        )
+
+        # ── Resolve model path (ROS-native) ──────────────────────────────────
+        if model_path_param:
+            model_path = pathlib.Path(model_path_param)
+        else:
+            pkg_share = pathlib.Path(
+                get_package_share_directory("neuro_adaptive_fusion")
+            )
+            model_path = pkg_share / "models" / "neuro_adapter.tflite"
+
+        # ── Load TFLite Interpreter ──────────────────────────────────────────
         if not model_path.exists():
             self.get_logger().fatal(f"Model not found: {model_path}")
             raise FileNotFoundError(f"TFLite model not found: {model_path}")
 
-        try:
-            self._interpreter = tf.lite.Interpreter(model_path=str(model_path))
-            self._interpreter.allocate_tensors()
-            self.get_logger().info("✅ TFLite Interpreter Loaded Successfully")
-        except Exception as e:
-            self.get_logger().fatal(f"Failed to initialize TFLite Interpreter: {e}")
-            raise
+        self._interpreter = Interpreter(model_path=str(model_path))
+        self._interpreter.allocate_tensors()
+
+        self.get_logger().info(f"✅ TFLite model loaded: {model_path}")
 
         self._input_detail = self._interpreter.get_input_details()[0]
         self._output_detail = self._interpreter.get_output_details()[0]
 
-        # Quantisation parameters for INT8 input
-        self._input_dtype: np.dtype = self._input_detail["dtype"]
+        self._input_dtype = self._input_detail["dtype"]
         qp = self._input_detail.get("quantization_parameters", {})
-        self._input_scale: float = float(qp.get("scales", [1.0])[0])
-        self._input_zp: int = int(qp.get("zero_points", [0])[0])
+        self._input_scale = float(qp.get("scales", [1.0])[0])
+        self._input_zp = int(qp.get("zero_points", [0])[0])
 
         self._lock = threading.Lock()
 
         self.get_logger().info(
-            f"DNNInference ready  "
-            f"[model={model_path}, α={self._alpha}, "
-            f"input_dtype={self._input_dtype.__name__}]"
+            f"DNNInference ready [α={self._alpha}, input_dtype={self._input_dtype}]"
         )
 
         # ── Pub / Sub ────────────────────────────────────────────────────────
@@ -108,83 +106,65 @@ class DNNInference(Node):
             Float32MultiArray,
             "/neuro/features",
             self._feature_cb,
-            qos_profile=10,
+            10,
         )
+
         self._pub = self.create_publisher(
             Float32MultiArray,
             "/neuro/covariance_correction",
-            qos_profile=10,
+            10,
         )
 
     # ── Callback ─────────────────────────────────────────────────────────────
 
     def _feature_cb(self, msg: Float32MultiArray) -> None:
-        """Run inference on incoming feature vector and publish R_adapt."""
-        # STRICT TYPE CASTING to float32 to avoid segfaults in some TFLite builds
         features = np.array(msg.data, dtype=np.float32)
 
         if features.shape[0] != N_FEATURES:
             self.get_logger().warn(
-                f"Expected {N_FEATURES} features, got {features.shape[0]} — skipping",
+                f"Expected {N_FEATURES} features, got {features.shape[0]}",
                 throttle_duration_sec=5.0,
             )
             return
 
-        # ── Quantise input if model expects INT8 ────────────────────────────
-        # Ensure input tensor matches model input shape (1, 24)
         input_tensor = features.reshape(1, N_FEATURES)
 
         if self._input_dtype == np.int8:
-            # Scale and zero-point arithmetic
             input_tensor = np.round(input_tensor / self._input_scale) + self._input_zp
             input_tensor = np.clip(input_tensor, -128, 127).astype(np.int8)
         elif self._input_dtype == np.uint8:
             input_tensor = np.round(input_tensor / self._input_scale) + self._input_zp
             input_tensor = np.clip(input_tensor, 0, 255).astype(np.uint8)
 
-        # ── Inference (serialised) ──────────────────────────────────────────
         with self._lock:
-            try:
-                t0: int = time.monotonic_ns()
-                self._interpreter.set_tensor(self._input_detail["index"], input_tensor)
-                self._interpreter.invoke()
-                output_data = self._interpreter.get_tensor(self._output_detail["index"])
-                delta_r = output_data.flatten().astype(np.float32)
-                dt_us: float = (time.monotonic_ns() - t0) / 1e3
-            except Exception as e:
-                self.get_logger().error(
-                    f"Inference failed: {e}", throttle_duration_sec=1.0
-                )
-                return
+            t0 = time.monotonic_ns()
+            self._interpreter.set_tensor(self._input_detail["index"], input_tensor)
+            self._interpreter.invoke()
+            output = self._interpreter.get_tensor(self._output_detail["index"])
+            delta_r = output.flatten().astype(np.float32)
+            dt_us = (time.monotonic_ns() - t0) / 1e3
 
-        # ── Eq 30:  R_adapt = R₀ + α · ΔR_dnn ──────────────────────────────
-        delta_r_clamped: np.ndarray = np.clip(delta_r, 0.0, None)  # ΔR ≥ 0
-        r_adapt: np.ndarray = R0_VAR + self._alpha * delta_r_clamped
+        r_adapt = R0_VAR + self._alpha * np.clip(delta_r, 0.0, None)
 
-        # ── Publish ─────────────────────────────────────────────────────────
-        out_msg = Float32MultiArray()
-        out_msg.layout.dim = [
+        msg_out = Float32MultiArray()
+        msg_out.layout.dim = [
             MultiArrayDimension(
                 label="r_adapt_diag",
                 size=N_CHANNELS,
                 stride=N_CHANNELS,
-            ),
+            )
         ]
-        out_msg.data = r_adapt.tolist()
-        self._pub.publish(out_msg)
+        msg_out.data = r_adapt.tolist()
+        self._pub.publish(msg_out)
 
-        self.get_logger().debug(
-            f"Inference: {dt_us:.0f} µs | ΔR={delta_r_clamped} | R_adapt={r_adapt}"
-        )
+        self.get_logger().debug(f"Inference {dt_us:.0f} µs | R={r_adapt}")
 
 
-def main(args: list[str] | None = None) -> None:
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = DNNInference()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
