@@ -42,6 +42,7 @@ import numpy as np  # noqa: E402
 import rclpy  # noqa: E402
 from rclpy.node import Node  # noqa: E402
 from std_msgs.msg import (  # noqa: E402
+    Bool,
     Float32MultiArray,
     MultiArrayDimension,
 )
@@ -144,15 +145,33 @@ class SimNode(Node):
         # Rolling history for the dashboard
         self._h_time: collections.deque[float] = collections.deque(maxlen=PLOT_HISTORY)
         self._h_truth: collections.deque[float] = collections.deque(maxlen=PLOT_HISTORY)
-        self._h_err_base: collections.deque[float] = collections.deque(maxlen=PLOT_HISTORY)
-        self._h_err_adapt: collections.deque[float] = collections.deque(maxlen=PLOT_HISTORY)
+        self._h_err_base: collections.deque[float] = collections.deque(
+            maxlen=PLOT_HISTORY
+        )
+        self._h_err_adapt: collections.deque[float] = collections.deque(
+            maxlen=PLOT_HISTORY
+        )
         self._h_innov: collections.deque[float] = collections.deque(maxlen=PLOT_HISTORY)
-        self._h_delta_r: collections.deque[float] = collections.deque(maxlen=PLOT_HISTORY)
+        self._h_delta_r: collections.deque[float] = collections.deque(
+            maxlen=PLOT_HISTORY
+        )
 
         # ── ROS 2 interfaces ────────────────────────────────────────────────
         self._pub = self.create_publisher(
             Float32MultiArray,
             "/ekf/innovations",
+            10,
+        )
+        # State vector for data_logger: [sim_t, true_z, est_base, est_adapt, delta_r]
+        self._pub_state = self.create_publisher(
+            Float32MultiArray,
+            "/sim/state",
+            10,
+        )
+        # Noise gate flag for data_logger (True during Transition phase)
+        self._pub_gate = self.create_publisher(
+            Bool,
+            "/diagnostics/noise_gate",
             10,
         )
         self._sub = self.create_subscription(
@@ -200,9 +219,9 @@ class SimNode(Node):
         elif t < T_TRANSITION_END:
             # Phase B: Transition Corridor — heavy noise + sinusoidal vibration
             #   noise = N(0, √2.0) + 2.0 · sin(2π · 25 · t)
-            noise = float(self._rng.normal(0.0, math.sqrt(SIGMA2_TRANSITION))) + VIB_AMP * math.sin(
-                2.0 * math.pi * VIB_FREQ_HZ * t
-            )
+            noise = float(
+                self._rng.normal(0.0, math.sqrt(SIGMA2_TRANSITION))
+            ) + VIB_AMP * math.sin(2.0 * math.pi * VIB_FREQ_HZ * t)
 
         else:
             # Phase C: Cruise — nominal Gaussian
@@ -228,6 +247,26 @@ class SimNode(Node):
         ]
         msg.data = innov_vec.tolist()
         self._pub.publish(msg)
+
+        # ── publish /sim/state for data_logger ───────────────────────────────
+        # Layout: [sim_t, true_z, est_base, est_adapt, delta_r]
+        state_msg = Float32MultiArray()
+        state_msg.layout.dim = [
+            MultiArrayDimension(label="state", size=5, stride=5),
+        ]
+        state_msg.data = [
+            float(t),
+            float(x_true),
+            float(est_base),
+            float(est_adapt),
+            float(dr),
+        ]
+        self._pub_state.publish(state_msg)
+
+        # ── publish /diagnostics/noise_gate for data_logger ──────────────────
+        gate_msg = Bool()
+        gate_msg.data = bool(T_HOVER_END <= t < T_TRANSITION_END)
+        self._pub_gate.publish(gate_msg)
 
         # ── record to history (under lock) ───────────────────────────────────
         with self._lock:
@@ -291,7 +330,13 @@ def _run_dashboard(node: SimNode) -> None:
         yl = ax.get_ylim()
         y_top = yl[1] * 0.88
         ax.text(
-            T_HOVER_END / 2, y_top, "HOVER", ha="center", fontsize=8, color="#4caf50", alpha=0.5
+            T_HOVER_END / 2,
+            y_top,
+            "HOVER",
+            ha="center",
+            fontsize=8,
+            color="#4caf50",
+            alpha=0.5,
         )
         ax.text(
             (T_HOVER_END + T_TRANSITION_END) / 2,
@@ -317,7 +362,9 @@ def _run_dashboard(node: SimNode) -> None:
     ax1.set_title("Position Estimation Error", fontsize=11, color="#b0bec5")
     ax1.set_ylabel("Error (m)")
     (ln_truth,) = ax1.plot([], [], color="#4caf50", lw=1.5, label="Ground Truth")
-    (ln_base,) = ax1.plot([], [], color="#f44336", lw=0.8, alpha=0.85, label="Baseline EKF")
+    (ln_base,) = ax1.plot(
+        [], [], color="#f44336", lw=0.8, alpha=0.85, label="Baseline EKF"
+    )
     (ln_adapt,) = ax1.plot([], [], color="#00bcd4", lw=1.3, label="Neuro-Adaptive EKF")
     ax1.legend(loc="upper right", fontsize=8, framealpha=0.5)
     ax1.set_ylim(-6, 6)
@@ -325,14 +372,18 @@ def _run_dashboard(node: SimNode) -> None:
     _decorate(ax1)
 
     # ── Subplot 2: Innovation Sequence ───────────────────────────────────────
-    ax2.set_title("Innovation Sequence (Raw Sensor Noise)", fontsize=11, color="#b0bec5")
+    ax2.set_title(
+        "Innovation Sequence (Raw Sensor Noise)", fontsize=11, color="#b0bec5"
+    )
     ax2.set_ylabel("Innovation")
     (ln_innov,) = ax2.plot([], [], color="#ffc107", lw=0.5, alpha=0.9)
     ax2.set_ylim(-8, 8)
     _decorate(ax2)
 
     # ── Subplot 3: Neural Network Correction ─────────────────────────────────
-    ax3.set_title("Neural Network Covariance Correction (ΔR)", fontsize=11, color="#b0bec5")
+    ax3.set_title(
+        "Neural Network Covariance Correction (ΔR)", fontsize=11, color="#b0bec5"
+    )
     ax3.set_ylabel("ΔR")
     ax3.set_xlabel("Time (s)")
     (ln_dr,) = ax3.plot([], [], color="#ce93d8", lw=1.2)
