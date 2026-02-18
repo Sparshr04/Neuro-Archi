@@ -283,7 +283,7 @@ def main(args: list[str] | None = None) -> None:
             node._csv_file.flush()
             node._csv_file.close()
     finally:
-        executor.shutdown(wait_for_result=False)
+        executor.shutdown()
         if rclpy.ok():
             node.destroy_node()
             rclpy.shutdown()
