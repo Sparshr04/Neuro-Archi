@@ -26,13 +26,12 @@
 #     ros2 launch neuro_adaptive_fusion system.launch.py
 # """
 
-
 """sim_node.py — SITL Digital Twin for Neuro-Adaptive EKF Validation.
 
-Updates:
-- LINEAR RESPONSE: Replaced quadratic penalty with linear to prevent "explosive" corrections.
-- SMOOTHING: Added a Low-Pass Filter (LPF) to delta_r so the correction is smooth, not jagged.
-- TUNED GAINS: Adjusted threshold and gain for a balanced response.
+Features:
+- LOGIC: Linear Response + Low-Pass Filter (Smoothing) for stable corrections.
+- LOGGING: Publishes /sim/state and /diagnostics/noise_gate for external data logging.
+- VISUALS: Optimized real-time dashboard with Noise Gate triggers.
 """
 
 from __future__ import annotations
@@ -50,7 +49,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, MultiArrayDimension
+from std_msgs.msg import (
+    Bool,
+    Float32MultiArray,
+    MultiArrayDimension,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -83,11 +86,9 @@ Q_PROCESS: Final[float] = 0.001
 NN_GATE_THRESHOLD: Final[float] = 1.5
 
 # 2. Gain: Linear response (Correction = Gain * Excess_Noise)
-#    Reduced from "Quadratic" to prevent explosions.
 NN_DAMPING_GAIN: Final[float] = 0.5
 
-# 3. Smoothing: Low-Pass Filter factor (0.0 = frozen, 1.0 = no smoothing)
-#    0.1 means "take 10% new value, keep 90% old value". Makes it smooth.
+# 3. Smoothing: Low-Pass Filter factor (0.1 = smooth, 1.0 = raw)
 NN_SMOOTHING_ALPHA: Final[float] = 0.1
 
 
@@ -150,7 +151,21 @@ class SimNode(Node):
         self._h_innov = collections.deque(maxlen=PLOT_HISTORY)
         self._h_delta_r = collections.deque(maxlen=PLOT_HISTORY)
 
+        # ── Publishers ──────────────────────────────────────────────────────
         self._pub = self.create_publisher(Float32MultiArray, "/ekf/innovations", 10)
+        # State vector for data_logger: [sim_t, true_z, est_base, est_adapt, delta_r]
+        self._pub_state = self.create_publisher(
+            Float32MultiArray,
+            "/sim/state",
+            10,
+        )
+        # Noise gate flag for data_logger (True during Transition phase)
+        self._pub_gate = self.create_publisher(
+            Bool,
+            "/diagnostics/noise_gate",
+            10,
+        )
+
         self._timer = self.create_timer(DT, self._tick)
 
         self.get_logger().info(f"Digital Twin Active: Smoothness={NN_SMOOTHING_ALPHA}")
@@ -158,9 +173,7 @@ class SimNode(Node):
     # ── MOCK NN LOGIC (Smoothed) ─────────────────────────────────────────────
 
     def _emulate_nn_prediction(self, innovation: float) -> float:
-        """
-        Simulates NN with Linear Response + Smoothing.
-        """
+        """Simulates NN with Linear Response + Smoothing."""
         mag = abs(innovation)
 
         # 1. Calculate Target Correction (Instantaneous)
@@ -175,7 +188,6 @@ class SimNode(Node):
         target_dr = min(target_dr, 3.0)
 
         # 2. Apply Smoothing (Low Pass Filter)
-        # new_val = alpha * target + (1 - alpha) * old_val
         self._dr_smooth = (NN_SMOOTHING_ALPHA * target_dr) + (
             (1.0 - NN_SMOOTHING_ALPHA) * self._dr_smooth
         )
@@ -222,12 +234,32 @@ class SimNode(Node):
         r_adapt = R_BASELINE + current_dr
         est_adapt = self._kf_adapt.update(measurement, r_adapt)
 
-        # Publish
+        # ── Publish Data ────────────────────────────────────────────────────
+
+        # /ekf/innovations (for consistency)
         msg = Float32MultiArray()
         msg.data = [float(innovation)] * N_CH
         self._pub.publish(msg)
 
-        # Record
+        # /sim/state (for Logger)
+        # Layout: [sim_t, true_z, est_base, est_adapt, delta_r]
+        state_msg = Float32MultiArray()
+        state_msg.layout.dim = [MultiArrayDimension(label="state", size=5, stride=5)]
+        state_msg.data = [
+            float(t),
+            float(x_true),
+            float(est_base),
+            float(est_adapt),
+            float(current_dr),
+        ]
+        self._pub_state.publish(state_msg)
+
+        # /diagnostics/noise_gate (for Logger)
+        gate_msg = Bool()
+        gate_msg.data = bool(T_HOVER_END <= t < T_TRANSITION_END)
+        self._pub_gate.publish(gate_msg)
+
+        # ── Record History ──────────────────────────────────────────────────
         with self._lock:
             self._h_time.append(t)
             self._h_truth.append(x_true)
@@ -288,11 +320,11 @@ def _run_dashboard(node: SimNode) -> None:
     ax3.set_title(
         "Neural Network Covariance Correction (ΔR)", fontsize=11, color="#b0bec5"
     )
-    (ln_dr,) = ax3.plot([], [], color="#ce93d8", lw=1.5)  # Thicker line for visibility
+    (ln_dr,) = ax3.plot([], [], color="#ce93d8", lw=1.5)
     ax3.axhline(
         NN_GATE_THRESHOLD, color="white", ls=":", alpha=0.3, label="Gate Trigger"
     )
-    ax3.set_ylim(-0.2, 4.0)  # Adjusted scale to fit the smoothed response
+    ax3.set_ylim(-0.2, 4.0)
     ax3.set_ylabel("Added Variance (m²)")
     _decorate(ax3)
 
