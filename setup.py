@@ -31,6 +31,7 @@ setup(
             "dnn_inference = neuro_adaptive_fusion.dnn_inference:main",
             "covariance_injector = neuro_adaptive_fusion.covariance_injector:main",
             "sim_node = neuro_adaptive_fusion.sim_node:main",
+            "data_logger = neuro_adaptive_fusion.data_logger:main",
         ],
     },
 )

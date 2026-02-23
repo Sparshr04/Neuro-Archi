@@ -1,0 +1,8 @@
+{
+  "peak_z_error": 0.914562,
+  "rmse_transition": 0.2525862483379496,
+  "noise_gate_latency_ms": 2.4999999999995026,
+  "dnn_correction_mean": 0.6412478342085522,
+  "dnn_correction_peak": 1.047619,
+  "filter_stability": "Stable"
+}
