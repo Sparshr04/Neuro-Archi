@@ -1,0 +1,63 @@
+# Simulink Architecture Description
+# Model Name: hybrid_vtol_benchmark.slx
+
+1. **Model Configuration**
+   - Solver: Fixed-step
+   - Solver Details: Fixed-step size = `dt` (from workspace, 0.0025)
+   - Stop Time: `T_final` (30.0)
+
+2. **Guidance & Control Layer**
+   - **Reference Generation**:
+     - Block: `1-D Lookup Table` (x2)
+     - Input: Clock source `Tout`
+     - Table 1 Data: `time_waypoints`, `velocity_waypoints` -> Output: `Vel_Cmd`
+     - Table 2 Data: `time_waypoints`, `altitude_waypoints` -> Output: `Alt_Cmd`
+   - **Autopilot Cores**:
+     - Block: `PID Controller` (continuous)
+     - Channel: Altitude Control -> Inputs: `Alt_Cmd`, Feedback `Pos_Z` (Note: Z is Down in NED, handle sign appropriately. If ENU block, use Z Up).
+     - Channel: Velocity Control -> Inputs: `Vel_Cmd`, Feedback `Vel_Forward`.
+     - Output: Forces/Moments to Plant.
+
+3. **Plant Model**
+   - **Block**: `6DOF (Quaternion)` from Aerospace Blockset -> Equations of Motion.
+   - **Configuration**:
+     - Initial Conditions: Position=[0,0,0], Velocity=[0,0,0], Euler=[0,0,0].
+     - Mass: variable `mass` (3.2).
+     - Inertia: variable `inertia_tensor` ([0.08 0 0; 0 0.1 0; 0 0 0.15]).
+     - Inputs: Forces (X,Y,Z) and Moments (L,M,N) in Body Frame.
+
+4. **Sensor & Environment**
+   - **Standard Sensors**:
+     - Extract `Vel_b`, `Pos_e`, `Euler` from 6DOF state bus.
+     - Acceleration: Use `6DOF` block's `Ae` (Earth accel) or `Ab` (Body accel) output port. **CRITICAL**: Use Body Acceleration for IMU emulation.
+
+5. **Transition Noise Subsystem (The Critical Validator)**
+   - **Purpose**: Inject stress test noise strictly during the transition phase.
+   - **Input**: Clean Accelerometer signal (from 6DOF Plant).
+   - **Components**:
+     1. **Clock**: `Clock` source.
+     2. **Trigger Logic**:
+        - Block: `MATLAB Function`
+        - Code: `y = (u > 10) && (u < 20);`
+        - Input: `Clock`. Output: `Trigger_Signal` (0 or 1).
+     3. **Noise Source A (Broadband)**:
+        - Block: `Band-Limited White Noise`
+        - Noise Power: `0.5`
+        - Seed: `42`
+        - Sample Time: `dt`
+     4. **Noise Source B (Tonal)**:
+        - Block: `Sine Wave`
+        - Amplitude: `1.0`
+        - Frequency: `2 * pi * 25` (Rad/sec)
+        - Phase: `0`
+     5. **Injection Logic**:
+        - Sum: `Raw_Noise = Noise_A + Noise_B`
+        - Product: `Gated_Noise = Raw_Noise * Trigger_Signal`
+        - Sum: `Noisy_Accel = Clean_Body_Accel + Gated_Noise`
+   - **Output**: This `Noisy_Accel` is the signal to be logged as `accel_x`, `accel_y`, `accel_z` (apply widely or specific channels as per Python parity. Assume applied to ALL channels or dominant axis if specified. Prompt says "add strictly to the Accelerometer output channel", implying all 3 or scalar addition? Usually scalar noise added to vector requires vector expansion. Assume isotropic noise or added to Z/Vertical axis if unspecified, BUT "matches the Python implementation exactly" implies isotropic or specific. *Plan*: Add to ALL 3 axes for stress test unless "channel" implies singular. Prompt says "Accelerometer output channel" (singular?). I will assume it applies to the Z-axis (Lift) or X-axis (Transition) primarily, but strict parity requires knowledge of Python. *Decision*: Apply to ALL AXES to ensure stress is captured, or define strictly. I will specify "Add to Output Vector".)
+
+6. **Data Logging**
+   - Block: `To Workspace`
+   - Variable Name: `sim_out_data`
+   - Save Format: `Structure with Time` or `Array`.
+   - Signals to Log: `Position_ENU`, `Velocity_ENU`, `Euler_ENU`, `Noisy_Body_Accel`, `Body_Rates`.

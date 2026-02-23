@@ -14,15 +14,17 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/system.launch.py"]),
         # CRITICAL: Re-added this line so the node can find your AI model
-        (os.path.join("share", package_name, "models"), glob("ml_core/models/*.tflite")),
+        (
+            os.path.join("share", package_name, "models"),
+            glob("ml_core/models/*.tflite"),
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="sparsh",
-    maintainer_email="sparsh@dypiu.ac.in",
+    maintainer_email="sparshr2004@gmail.com",
     description="Neuro-Adaptive Sensor Fusion Package",
     license="Proprietary",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "innovation_monitor = neuro_adaptive_fusion.innovation_monitor:main",
