@@ -24,6 +24,16 @@ Cube Orange+ (PX4 EKF2)              Raspberry Pi 5
   EKF2 R matrix ◀── MAVLink ──────────┘
 ```
 
+## Analysis and Results
+
+### Active FDNN
+![Active FDNN](./assets/active_fdnn_720.gif)
+
+### Inactive FDNN
+![Inactive FDNN](./assets/inactive_fdnn_720.gif)
+
+
+
 ## Prerequisites
 
 | Tool | Version |
